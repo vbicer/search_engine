@@ -73,7 +73,39 @@ class crawler:
 
     # Add link between two pages
     def add_link_ref(self, url_from, url_to, link_text):
-        pass
+        words = self.separate_words(link_text)
+        fromid = self.get_entry_id('urllist', 'url', url_from)
+        toid = self.get_entry_id('urllist', 'url', url_to)
+
+        if fromid == toid: return
+        linkid = self.con.execute('insert into link (fromid, toid) values (%d, %d)' % (fromid, toid)).lastrowid
+        for word in words:
+            if word in self.ingore_words: continue
+            wordid = self.get_entry_id('wordlist', 'word', word)
+            self.con.execute('insert into linkwords (wordid, linkid) values (%d, %d)' % (wordid, linkid))
+
+    def calculate_page_rank(self, iterations=20):
+        # Clear current page rank table_list
+        self.con.execute('drop table if exists pagerank')
+        self.con.execute('create table pagerank(urlid primary key, score)')
+
+        # Initialize every url with page rank 1
+        self.con.execute('insert into pagerank select rowid, 1.0 from urllist')
+        self.db_commit()
+
+        for i in range(iterations):
+            print('Iteration', i)
+            for urlid, in self.con.execute('select rowid from urllist'):
+                pr = 0.15
+                # Loop through all the pages that link to this one
+                for linker, in self.con.execute('select distinct fromid from link where toid = %d' % urlid):
+                    # Get the page rank of linker
+                    linker_page_rank = self.con.execute('select score from pagerank where urlid = %d' % linker).fetchone()[0]
+                    linking_count = self.con.execute('select count(*) from link where fromid = %d' % linker).fetchone()[0]
+                    pr += 0.85 * (linker_page_rank/linking_count)
+                    print(pr, urlid)
+                    self.con.execute('update pagerank set score = %f where urlid = %d' % (pr, urlid))
+                self.db_commit()
 
     def crawl(self, pages, depth= 2):
         for i in range(depth):
@@ -131,12 +163,49 @@ class searcher:
     def get_scored_list(self, rows, word_ids):
         total_scores = dict([(row[0], 0) for row in rows])
 
-        weights = [(1.0, self.locaiton_scores(rows))]
+        weights = [(1.0, self.locaiton_scores(rows)),
+                   (1.0, self.frequency_score(rows)),
+                   (1.0, self.page_rank_score(rows)),
+                   (1.0, self.link_text_score(rows, word_ids))]
 
         for weight, scores in weights:
             for url in total_scores:
                 total_scores[url] += weight * scores[url]
         return total_scores
+
+    def get_match_rows(self, query):
+        field_list = 'w0.urlid'
+        table_list = ''
+        clause_list = ''
+        word_ids = []
+
+        words = query.split(' ')
+        table_number = 0
+
+        for word in words:
+            wordrow = self.con.execute("select rowid from wordlist where word='%s'" % word).fetchone()
+            if wordrow != None:
+                wordid = wordrow[0]
+                word_ids.append(wordid)
+                if table_number > 0:
+                    table_list += ' ,'
+                    clause_list += ' and w%d.urlid = w%d.urlid and ' %(table_number-1, table_number)
+                field_list += ' ,w%d.location' % table_number
+                table_list += ' wordlocation w%d' % table_number
+                clause_list += ' w%d.wordid = %d' % (table_number, wordid)
+                table_number += 1
+
+        sql_query = "select %s from %s where %s" % (field_list, table_list, clause_list)
+        cur = self.con.execute(sql_query)
+        rows = [row for row in cur]
+        return rows, word_ids
+
+    def query(self, q):
+        rows, word_ids = self.get_match_rows(q)
+        scores = self.get_scored_list(rows, word_ids)
+        ranked_scores = sorted([(score, url)for url, score in scores.items()], reverse=1)
+        for (score, url) in ranked_scores:
+            print(score,' -> ', self.get_url_name(url))
 
     # Each of the scoring functions calls this function to normalize its result
     # Return value between 0 and 1
@@ -177,36 +246,17 @@ class searcher:
         inbound_count = dict([(id, self.con.execute('select count(*) from link where toid = %d' % id)) for id in urls])
         return self.normalize_scores(inbound_count)
 
-    def get_match_rows(self, query):
-        field_list = 'w0.urlid'
-        table_list = ''
-        clause_list = ''
-        word_ids = []
+    def page_rank_score(self, rows):
+        urls = set([row[0] for row in rows])
+        page_ranks = dict([(urlid, self.con.execute('select score from pagerank where urlid = %d' % urlid).fetchone()[0]) for urlid in urls])
+        return self.normalize_scores(page_ranks)
 
-        words = query.split(' ')
-        table_number = 0
-
-        for word in words:
-            wordrow = self.con.execute("select rowid from wordlist where word='%s'" % word).fetchone()
-            if wordrow != None:
-                wordid = wordrow[0]
-                word_ids.append(word)
-                if table_number > 0:
-                    table_list += ' ,'
-                    clause_list += ' and w%d.urlid = w%d.urlid and ' %(table_number-1, table_number)
-                field_list += ' ,w%d.location' % table_number
-                table_list += ' wordlocation w%d' % table_number
-                clause_list += ' w%d.wordid = %d' % (table_number, wordid)
-                table_number += 1
-
-        sql_query = "select %s from %s where %s" % (field_list, table_list, clause_list)
-        cur = self.con.execute(sql_query)
-        rows = [row for row in cur]
-        return rows, word_ids
-
-    def query(self, q):
-        rows, word_ids = self.get_match_rows(q)
-        scores = self.get_scored_list(rows, word_ids)
-        ranked_scores = sorted([(score, url)for url, score in scores.items()], reverse=1)
-        for (score, url) in ranked_scores:
-            print(score,' -> ', self.get_url_name(url))
+    def link_text_score(self, rows, word_ids):
+        link_scores = dict([(row[0], 0) for row in rows])
+        for wordid in word_ids:
+            cur = self.con.execute('select link.fromid, link.toid from linkwords, link where wordid = %d and linkwords.linkid = link.rowid' % wordid)
+            for fromid, toid in cur:
+                if toid in link_scores:
+                    page_rank = self.con.execute('select score from pagerank where urlid = %d' % fromid).fetchone()[0]
+                    link_scores[toid] += page_rank
+        return self.normalize_scores(link_scores)
